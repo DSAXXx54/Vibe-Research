@@ -6,7 +6,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { readResearchControl, reserveResearch, updateResearchControl, requestResearchCancellation, researchDecision, ResearchControlError } from "./research_control.ts";
+import { readResearchControl, removeResearchControl, reserveResearch, updateResearchControl, requestResearchCancellation, researchDecision, ResearchControlError, type ResearchControl } from "./research_control.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -747,8 +747,10 @@ export function listRuns(ctx: ServiceContext, limit = 50): { run_id: string; sta
  *      不能删(可能正跑到一半,删了把半截运行连同已烧的额度一起抹掉);
  *   ④ **清单损坏**(是文件但 JSON 解析失败)→ manifest_corrupt:同上,数据已不可信,拒删并提示;
  *   ⑤ **清单未结束**(finished_at 缺失或非法时间)→ run_in_progress:还在写盘;
- *   ⑥ 进程级兜底:control(owner.json)明确未收尾(存在且 finished_at=null)→ run_in_progress。
- * 全部通过才 rmSync。
+ *   ⑥ 进程级兜底:control(owner.json)明确未收尾(存在且 finished_at=null)→ run_in_progress;
+ *      control 读不出来(损坏 / 路径含链接)→ control_unreadable,同样拒删。
+ * 全部通过才删:先删 control 记录,再 rmSync 运行目录(顺序理由见下)。
+ * 删除这两步自身失败(EACCES / EBUSY / ENOTEMPTY)→ delete_failed,不让 fs 的 errno 直接变成 500。
  */
 export function deleteRun(ctx: ServiceContext, runId: string): { run_id: string; deleted: boolean } {
   const { id, dir } = runDirOf(ctx, runId);
@@ -765,15 +767,30 @@ export function deleteRun(ctx: ServiceContext, runId: string): { run_id: string;
   const finished = m.finished_at;
   if (typeof finished !== "string" || !Number.isFinite(Date.parse(finished)))
     throw new ServiceError("run_in_progress", "该研究还在进行中(清单未记录结束时间),等它跑完再删");
-  // ⑥ 进程级兜底:control 存在且明确未收尾(比 manifest 更实时,worker 还在就拦住)
-  try {
-    const control = readResearchControl(ctx.dataRoot, id);
-    if (control && !control.finished_at) throw new ServiceError("run_in_progress", "该研究还在进行中,等它跑完再删");
-  } catch (e) {
-    // control 自身损坏/越权等不拦删除(manifest 已是终态硬证据);仅在它"明确在跑"时上面已拒
-    if (e instanceof ServiceError) throw e;
+  // ⑥ 进程级兜底:control(owner.json)比 manifest 更实时,worker 还在就拦住。
+  //    读不出来(损坏 / 路径含链接 / 权限)同样拒删:它抛的是 ResearchControlError,不是 ServiceError,
+  //    吞掉就等于"少了一条证据照删",而本函数的规矩是任何一条证据给不出"已结束"就不删。
+  let control: ResearchControl | null;
+  try { control = readResearchControl(ctx.dataRoot, id); }
+  catch (e) {
+    // 只有 ResearchControlError 是"记录本身有问题";EACCES/EMFILE 这类是环境故障,
+    // 一律说成"损坏"会把排查引到错的方向,所以非预期异常要留一行根因(拒删的结论不变)
+    if (!(e instanceof ResearchControlError)) console.error(`[deleteRun] 读取进程记录异常:${redact(e instanceof Error ? e.message : String(e), 200)}`);
+    throw new ServiceError("control_unreadable", "该研究的进程记录读不出来(可能损坏),无法确认它是否还在跑,未删除");
   }
-  fs.rmSync(dir, { recursive: true, force: true });
+  if (control && !control.finished_at) throw new ServiceError("run_in_progress", "该研究还在进行中,等它跑完再删");
+  // 先清进程记录再删运行目录:反过来的话这一步失败就只剩孤儿 control(reserveResearch 靠它判 run_exists),
+  // 而且用户已经看到目录没了却收到报错。这个顺序下第一步失败时运行目录还原封不动。
+  // 两步都要接:它们抛的是 fs 的 errno 错误(EACCES/EBUSY/ENOTEMPTY),不是 ServiceError ——
+  // 不接就直接 500 "internal",正好把上面 ⑥ 刚堵住的洞在这里重新开一个。
+  try {
+    removeResearchControl(ctx.dataRoot, id);
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? "unknown";
+    console.error(`[deleteRun] 删除未完成(${code}):${redact(e instanceof Error ? e.message : String(e), 200)}`);
+    throw new ServiceError("delete_failed", `删除没能完成(${code}),这次归档可能只删掉了一部分,请检查该运行目录的权限或是否被其他程序占用`);
+  }
   return { run_id: id, deleted: true };
 }
 

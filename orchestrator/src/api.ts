@@ -331,10 +331,13 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
         return send(res, 200, cancelResearch(ctx, b.run_id));
       }
       if (req.method === "DELETE" && parts[0] === "runs" && parts[1] && parts.length === 2) {
-        // 删除一次研究运行(归档清理,用户反馈 2026-09-06);service 层做终态确认——
-        // 清单缺失/损坏/未结束、control 明确在跑都拒(manifest_missing/manifest_corrupt/run_in_progress)
+        // 删除一次研究运行(归档清理,用户反馈 2026-09-06);service 层做终态确认——清单缺失/损坏/未结束、
+        // control 明确在跑或读不出来都拒(manifest_missing/manifest_corrupt/run_in_progress/control_unreadable),
+        // 删除动作本身失败则是 delete_failed。
         const r = deleteRun(ctx, parts[1]);
-        return send(res, r.deleted ? 200 : 404, r);
+        // 404 体带上 error 码:调用方要能把"这条本来就不在了"和"代理/路由返回的 404"分开,
+        // 只看状态码分不开(前端会把后者也当成删成功,见 backend.deleteRun)
+        return r.deleted ? send(res, 200, r) : send(res, 404, { ...r, error: "not_found" });
       }
       if (req.method === "GET" && url.pathname === "/runs") return send(res, 200, listRuns(ctx, q.limit ? Number(q.limit) : undefined));
       // 「昨天以来变了什么」:对齐同一对象最近两次研究。**不足两次会报 need_two_runs**,
