@@ -776,7 +776,7 @@ export function deleteRun(ctx: ServiceContext, runId: string): { run_id: string;
     // 只有 ResearchControlError 是"记录本身有问题";EACCES/EMFILE 这类是环境故障,
     // 一律说成"损坏"会把排查引到错的方向,所以非预期异常要留一行根因(拒删的结论不变)
     if (!(e instanceof ResearchControlError)) console.error(`[deleteRun] 读取进程记录异常:${redact(e instanceof Error ? e.message : String(e), 200)}`);
-    throw new ServiceError("control_unreadable", "该研究的进程记录读不出来(可能损坏),无法确认它是否还在跑,未删除");
+    throw new ServiceError("control_unreadable", "该研究的进程记录读不出来(可能损坏,也可能是权限或路径问题),无法确认它是否还在跑,未删除;如确认这次运行早已结束,可手动删除该运行目录与 .local/research-control/<run-id>");
   }
   if (control && !control.finished_at) throw new ServiceError("run_in_progress", "该研究还在进行中,等它跑完再删");
   // 先清进程记录再删运行目录:反过来的话这一步失败就只剩孤儿 control(reserveResearch 靠它判 run_exists),

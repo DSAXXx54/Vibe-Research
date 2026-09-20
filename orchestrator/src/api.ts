@@ -396,6 +396,11 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
           return send(res, 413, { error: e.code, message: redact(e.message, 200) });
         }
         if (e.code === "resume_not_found") return send(res, 404, { error: e.code, message: redact(e.message, 200) });
+        // 其余 ServiceError 一律 400 —— **这是刻意的,别再按"语义更准"逐个改状态码**。
+        // 复审两轮都提过删除那组:run_in_progress / control_unreadable 像 409,delete_failed(EACCES/EBUSY)像 5xx。
+        // 不改的判据是"有没有消费者因此行为不同":调用方(desktop backend.ts)一律读 `error` 码做分支,
+        // 没有任何一处按 4xx/5xx 决定重试或告警;把四个码拆到三种状态只会让这组更不齐,
+        // 而 `error` 码本身已经把原因说得比状态码细。要改就四个一起改,并同时改前端与文档。
         return send(res, 400, { error: e.code, message: redact(e.message, 200) });
       }
       console.error(`[api] internal error: ${redact(e instanceof Error ? e.stack ?? e.message : String(e), 600)}`);
